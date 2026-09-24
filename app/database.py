@@ -31,6 +31,20 @@ CREATE TABLE IF NOT EXISTS audits (
 CREATE INDEX IF NOT EXISTS idx_audits_risk     ON audits(risk_level);
 CREATE INDEX IF NOT EXISTS idx_audits_filename ON audits(filename);
 CREATE INDEX IF NOT EXISTS idx_audits_created  ON audits(created_at);
+
+CREATE TABLE IF NOT EXISTS identifier_reports (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at          REAL    NOT NULL,
+    filename            TEXT,
+    source_length       INTEGER NOT NULL,
+    identifier_count    INTEGER NOT NULL,
+    distinct_spellings  INTEGER NOT NULL,
+    collision_count     INTEGER NOT NULL,
+      -- raw Python source is retained like audit raw_text
+    raw_source          TEXT    NOT NULL,
+    report_json         TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_id_reports_created ON identifier_reports(created_at);
 """
 
 # Columns added after the initial release (name -> column DDL).
@@ -163,3 +177,56 @@ def get_audit(audit_id: int) -> Optional[dict]:
     if row["meta_json"]:
         detail["meta"] = json.loads(row["meta_json"])
     return detail
+
+
+# ---------------------------------------------------------------------------
+# Identifier NFKC normalization collision reports (independent records)
+# ---------------------------------------------------------------------------
+
+def insert_identifier_report(
+    *,
+    filename: Optional[str],
+    source: str,
+    report: dict,
+) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO identifier_reports (
+                created_at, filename, source_length, identifier_count,
+                distinct_spellings, collision_count, raw_source, report_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                time.time(),
+                filename,
+                len(source),
+                report["identifier_count"],
+                report["distinct_spelling_count"],
+                report["collision_count"],
+                source,
+                json.dumps(report, ensure_ascii=False),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def get_identifier_report(report_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM identifier_reports WHERE id = ?", (report_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "filename": row["filename"],
+        "source_length": row["source_length"],
+        "identifier_count": row["identifier_count"],
+        "distinct_spelling_count": row["distinct_spellings"],
+        "collision_count": row["collision_count"],
+        "raw_source": row["raw_source"],
+        "report": json.loads(row["report_json"]),
+    }

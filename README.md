@@ -49,8 +49,11 @@ docker compose up --build
 
 服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
-启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`
-与 `POST /api/v1/audits/gate` 随服务一起可用（均通过宿主机 8000 端口访问）。
+启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
+`POST /api/v1/audits/gate` 与
+`POST /api/v1/identifiers/normalization`
+随服务一起可用（均通过宿主机 8000 端口访问，例如
+<http://localhost:8000/api/v1/identifiers/normalization>）。
 
 ### 仅用 Docker
 
@@ -380,6 +383,117 @@ curl -s -X POST http://localhost:8000/api/v1/audits/json \
 
 `invalid_json_document` 的 `detail` 含 `offset`（出错位置的码点偏移）与
 `line` / `column`（1 起始）。
+
+### `POST /api/v1/identifiers/normalization` — Python 标识符 NFKC 碰撞检测
+
+接收一段 **Python 源码**（`source` 字段，可选 `filename`），按 Python 词法规则
+（参考解释器的词法器，含 [PEP 3131](https://peps.python.org/pep-3131/) Unicode
+标识符）提取标识符：
+
+- **注释、字符串字面量、数字、运算符与结构符一律跳过**；
+- Python **硬关键字**（`def`、`return`、`True` 等）不作为标识符；判定前先做
+  NFKC 规范化，因此全角等宽混淆拼写（如 `Ｔｒｕｅ`）也按关键字 `True` 跳过；
+- 对每个保留下来的标识符原文做 **Unicode NFKC 规范化**。
+
+仅当**同一规范形存在至少两种不同的原文拼写**时才报告碰撞：
+
+- 同一拼写单纯重复多次 → **不是**碰撞；
+- 仅大小写不同（如 `X` 与 `x`）→ NFKC 保留大小写，**不是**碰撞；
+- 但全角 `Ｘ`、数学粗体 `𝐗` 与 ASCII `X` 共享规范形 `X`，或预组合 `é`（U+00E9）
+  与分解形式 `e` + U+0301 共享规范形 `é`，则构成碰撞；连字 `ﬁ`（U+FB01）
+  NFKC 规范化为 `fi`，同样可与 ASCII `fi` 碰撞。
+
+每个碰撞返回规范形 `normalised`、涉及的每种原文拼写 `spellings[]`，以及每种
+拼写的**全部出现位置** `occurrences[]`：`offset` / `end_offset` 为原文中的
+Unicode 码点偏移（0 起始、end 排他），`line` / `column` 为 1 起始行列。
+碰撞按规范形**首次出现的源码位置**排序，拼写按各自首次出现排序，每个拼写内的
+出现按源码顺序排列，输出完全稳定。
+
+碰撞报告作为**独立记录**保存（独立于 bidi 审计表），返回 `id` 后可用
+`GET /api/v1/identifiers/normalization/{id}` 读取（含原始源码 `raw_source`）；
+无碰撞的提交也会保存一条 `collision_count: 0` 的记录。
+
+```bash
+# 源码（注意码点差异，直接粘贴可能被输入法/编辑器归一化）：
+#   café        —— 预组合 U+00E9
+#   cafe\u0301  —— 'e' + 组合重音 U+0301 的分解形式
+#   Ｘ          —— 全角拉丁大写 X（U+FF38）
+#   \ud835\udc17 —— 数学粗体 X（U+1D417，astral 平面单码点）
+curl -s -X POST http://localhost:8000/api/v1/identifiers/normalization \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "def caf\u00e9():\n    return Ｘ + 𝐗\ncafe\u0301 = 2\n", "filename": "confusables.py"}' | jq
+```
+
+响应（节选；`offset` 为 Unicode 码点偏移，可直接在原始源码上切片复核）：
+
+```json
+{
+  "id": 1,
+  "stored": true,
+  "filename": "confusables.py",
+  "source_length": 39,
+  "report": {
+    "identifier_count": 4,
+    "distinct_spelling_count": 4,
+    "collision_count": 2,
+    "collisions": [
+      {
+        "normalised": "café",
+        "spelling_count": 2,
+        "occurrence_count": 2,
+        "spellings": [
+          {"spelling": "café", "occurrence_count": 1,
+           "occurrences": [{"offset": 4, "end_offset": 8, "line": 1, "column": 5}]},
+          {"spelling": "café", "occurrence_count": 1,
+           "occurrences": [{"offset": 29, "end_offset": 34, "line": 3, "column": 1}]}
+        ]
+      },
+      {
+        "normalised": "X",
+        "spelling_count": 2,
+        "occurrence_count": 2,
+        "spellings": [
+          {"spelling": "Ｘ", "occurrence_count": 1,
+           "occurrences": [{"offset": 23, "end_offset": 24, "line": 2, "column": 12}]},
+          {"spelling": "𝐗", "occurrence_count": 1,
+           "occurrences": [{"offset": 27, "end_offset": 28, "line": 2, "column": 16}]}
+        ]
+      }
+    ]
+  }
+}
+```
+
+> 上例中 `café` 的两种拼写分别是预组合 é（U+00E9）与 `e` + 组合重音 U+0301
+> （终端里外观几乎相同），两个 `X` 分别是全角 U+FF38 与数学粗体 U+1D417。
+
+按 ID 读取已保存的报告：
+
+```bash
+curl -s http://localhost:8000/api/v1/identifiers/normalization/1 | jq
+```
+
+错误情况（词法扫描失败时返回 **422**，`detail` 含出错位置的原文码点偏移
+`offset` 与 `line` / `column`，且**不产生任何审计/碰撞记录**）：
+
+| `detail.error` | 条件 |
+|---|---|
+| `unexpected_character` | 源码中存在 Python 词法不接受的字符（如 `$`、NUL、未依附标识符的游离组合记号） |
+| `unterminated_string` | 多行字符串（三引号等）未终止 |
+| `unterminated_statement` | 源码在括号/显式续行等多行语句中途结束 |
+| `indentation_error` | 缩进不一致（Tab/空格混用、unindent 不匹配等） |
+
+```json
+{
+  "detail": {
+    "error": "unexpected_character",
+    "offset": 6,
+    "line": 1,
+    "column": 7,
+    "message": "unexpected character '$' (U+0024) while tokenizing Python source"
+  }
+}
+```
 
 ### `GET /api/v1/audits` — 查询历史记录
 
@@ -786,6 +900,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
+│   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告与码点偏移
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
@@ -799,6 +914,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_bidi.py   # 解析器单元测试 + API 冒烟测试
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
+│   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_gate.py   # 路径风险门禁测试（模板匹配/优先级/默认阈值/只读/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
@@ -846,7 +962,14 @@ JSON 文档审计覆盖字符串值递归审计（键不审计）、RFC 6901 指
 （不跨 `/`，含 `*.py` 扩展名规则）、`**` 零段/一段/多段/连续 `**`/模板中部
 与边界匹配、固定段数优先、同固定段数时总段数优先、仍同分时请求靠前优先、
 未命中与无文件名回退默认阈值、阈值边界包含判定、风险排序与整体结论、
-结果按请求顺序与重复 ID、只读性，以及 404（含缺失 ID）与 422 分支。
+结果按请求顺序与重复 ID、只读性，以及 404（含缺失 ID）与 422 分支；
+标识符 NFKC 碰撞检测覆盖按 Python 词法提取标识符（注释/字符串/数字/运算符跳过、
+硬关键字与全角等宽混淆关键字跳过、软关键字保留、分解形式标识符的组合记号拼接、
+astral 平面码点偏移、CRLF 与前导 BOM）、仅不同原文拼写才算碰撞（纯重复与
+大小写不同不算）、fi 连字/全角/数学粗体等 NFKC 碰撞、碰撞与拼写及各拼写内
+出现的源码序稳定性、码点偏移切片复核、词法失败的 422 位置（非法字符、未终止
+字符串/语句、缩进错误，且不落库）、报告独立落库与按 ID 读取、404、缺字段 422
+以及与 bidi 审计表的相互独立性。
 
 ## 设计说明
 

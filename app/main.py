@@ -9,9 +9,18 @@ from fastapi.responses import JSONResponse
 
 from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
-from .database import count_audits, get_audit, init_db, insert_audit, query_audits
+from .database import (
+    count_audits,
+    get_audit,
+    get_identifier_report,
+    init_db,
+    insert_audit,
+    insert_identifier_report,
+    query_audits,
+)
 from .diff_audit import DiffParseError, audit_diff, highest_risk
 from .gate import GateRule, evaluate_record
+from .identifiers import IdentifierLexError, scan_identifiers
 from .json_audit import (
     DuplicateKeyError,
     JsonParseError,
@@ -24,6 +33,7 @@ from .schemas import (
     CompareRequest,
     DiffAuditRequest,
     GateRequest,
+    IdentifierNormalizationRequest,
     JsonAuditRequest,
 )
 from .verify import verify_audit_record
@@ -271,6 +281,57 @@ def create_json_audit(payload: JsonAuditRequest) -> dict:
     }
 
 
+@app.post("/api/v1/identifiers/normalization", status_code=201)
+def create_identifier_normalization(payload: IdentifierNormalizationRequest) -> dict:
+    """Extract Python identifiers and report NFKC normalisation collisions.
+
+    The source is lexed per Python's lexical rules: comments, strings and
+    hard keywords never count as identifiers.  Every surviving identifier
+    is Unicode NFKC normalised, and a collision is reported only when the
+    same normalised form has at least two distinct raw spellings (mere
+    repetition or case differences are not collisions).  Occurrences are
+    returned in source order with their codepoint offsets.  The whole
+    report is persisted as an independent record.  A lexical failure
+    yields 422 with the original-source position and writes nothing.
+    """
+    try:
+        report = scan_identifiers(payload.source).to_dict()
+    except IdentifierLexError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": exc.error,
+                "offset": exc.offset,
+                "line": exc.line,
+                "column": exc.column,
+                "message": exc.message,
+            },
+        )
+
+    report_id = insert_identifier_report(
+        filename=payload.filename, source=payload.source, report=report
+    )
+    return {
+        "id": report_id,
+        "stored": True,
+        "filename": payload.filename,
+        "source_length": len(payload.source),
+        "report": report,
+    }
+
+
+@app.get("/api/v1/identifiers/normalization/{report_id}")
+def read_identifier_normalization(report_id: int) -> dict:
+    """Read one stored identifier normalisation collision report."""
+    record = get_identifier_report(report_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="identifier normalization report not found",
+        )
+    return record
+
+
 @app.get("/api/v1/audits")
 def list_audits(
     risk_level: Optional[RiskLevel] = Query(
@@ -344,10 +405,12 @@ def root() -> dict:
             "POST /api/v1/audits/json",
             "POST /api/v1/audits/compare",
             "POST /api/v1/audits/gate",
+            "POST /api/v1/identifiers/normalization",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
             "GET  /api/v1/audits/{id}/verify",
             "GET  /api/v1/audits/{id}/sarif",
+            "GET  /api/v1/identifiers/normalization/{id}",
             "GET  /health",
         ],
     }

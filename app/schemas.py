@@ -65,6 +65,22 @@ class JsonAuditRequest(BaseModel):
     )
 
 
+class IdentifierNormalizationRequest(BaseModel):
+    source: str = Field(
+        ...,
+        description=(
+            "Python source code. Identifiers are extracted per Python's "
+            "lexical rules (comments, strings and hard keywords skipped) "
+            "and compared after Unicode NFKC normalisation."
+        ),
+    )
+    filename: Optional[str] = Field(
+        default=None,
+        max_length=4096,
+        description="Optional source file name for later lookup.",
+    )
+
+
 class GateRuleSpec(BaseModel):
     template: str = Field(
         ...,
