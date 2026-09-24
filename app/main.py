@@ -9,9 +9,20 @@ from fastapi.responses import JSONResponse
 
 from .bidi import RiskLevel, parse_bidi
 from .compare import compare_audits
-from .database import count_audits, get_audit, init_db, insert_audit, query_audits
+from .database import (
+    count_audits,
+    count_normalization_reports,
+    get_audit,
+    get_normalization_report,
+    init_db,
+    insert_audit,
+    insert_normalization_report,
+    query_audits,
+    query_normalization_reports,
+)
 from .diff_audit import DiffParseError, audit_diff, highest_risk
 from .gate import GateRule, evaluate_record
+from .identifier_norm import IdentifierLexError, scan_identifier_collisions
 from .json_audit import (
     DuplicateKeyError,
     JsonParseError,
@@ -24,6 +35,7 @@ from .schemas import (
     CompareRequest,
     DiffAuditRequest,
     GateRequest,
+    IdentifierNormalizationRequest,
     JsonAuditRequest,
 )
 from .verify import verify_audit_record
@@ -271,6 +283,81 @@ def create_json_audit(payload: JsonAuditRequest) -> dict:
     }
 
 
+@app.post("/api/v1/identifiers/normalization", status_code=201)
+def create_normalization_report(payload: IdentifierNormalizationRequest) -> dict:
+    """Scan Python source for NFKC-normalized identifier collisions.
+
+    Identifiers are extracted with Python's lexical rules: comments,
+    string literals and keywords never count.  Every identifier spelling
+    is mapped through Unicode NFKC; a collision is reported only when a
+    normalized form belongs to two or more distinct raw spellings.  Each
+    report (including zero-collision scans) is persisted as its own
+    record and can be fetched by ID.  A lexical failure yields 422 with
+    the offending source position and writes nothing.
+    """
+    try:
+        report = scan_identifier_collisions(payload.source).to_dict()
+    except IdentifierLexError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_python_source",
+                "offset": exc.offset,
+                "line": exc.line,
+                "column": exc.column,
+                "message": exc.message,
+            },
+        )
+
+    report_id = insert_normalization_report(
+        filename=payload.filename, source=payload.source, report=report
+    )
+    return {
+        "id": report_id,
+        "stored": True,
+        "filename": payload.filename,
+        "source_length": len(payload.source),
+        "identifier_count": report["identifier_count"],
+        "normalized_count": report["normalized_count"],
+        "collision_count": report["collision_count"],
+        "collisions": report["collisions"],
+    }
+
+
+@app.get("/api/v1/identifiers/normalization")
+def list_normalization_reports(
+    only_collisions: bool = Query(
+        default=False,
+        description="Only return reports containing at least one collision.",
+    ),
+    filename: Optional[str] = Query(
+        default=None, description="Case-insensitive substring match on filename"
+    ),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    items = query_normalization_reports(
+        only_collisions=only_collisions,
+        filename=filename,
+        limit=limit,
+        offset=offset,
+    )
+    total = count_normalization_reports(
+        only_collisions=only_collisions, filename=filename
+    )
+    return {"total": total, "limit": limit, "offset": offset, "items": items}
+
+
+@app.get("/api/v1/identifiers/normalization/{report_id}")
+def read_normalization_report(report_id: int) -> dict:
+    record = get_normalization_report(report_id)
+    if record is None:
+        raise HTTPException(
+            status_code=404, detail="normalization report not found"
+        )
+    return record
+
+
 @app.get("/api/v1/audits")
 def list_audits(
     risk_level: Optional[RiskLevel] = Query(
@@ -344,10 +431,13 @@ def root() -> dict:
             "POST /api/v1/audits/json",
             "POST /api/v1/audits/compare",
             "POST /api/v1/audits/gate",
+            "POST /api/v1/identifiers/normalization",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
             "GET  /api/v1/audits/{id}/verify",
             "GET  /api/v1/audits/{id}/sarif",
+            "GET  /api/v1/identifiers/normalization",
+            "GET  /api/v1/identifiers/normalization/{id}",
             "GET  /health",
         ],
     }

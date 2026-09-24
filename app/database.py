@@ -31,6 +31,20 @@ CREATE TABLE IF NOT EXISTS audits (
 CREATE INDEX IF NOT EXISTS idx_audits_risk     ON audits(risk_level);
 CREATE INDEX IF NOT EXISTS idx_audits_filename ON audits(filename);
 CREATE INDEX IF NOT EXISTS idx_audits_created  ON audits(created_at);
+
+CREATE TABLE IF NOT EXISTS normalization_reports (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at        REAL    NOT NULL,
+    filename          TEXT,
+    source_length     INTEGER NOT NULL,
+    identifier_count  INTEGER NOT NULL,
+    normalized_count  INTEGER NOT NULL,
+    collision_count   INTEGER NOT NULL,
+      -- raw source is retained so the lexical scan can be reviewed later
+    raw_source        TEXT    NOT NULL,
+    report_json       TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_norm_created ON normalization_reports(created_at);
 """
 
 # Columns added after the initial release (name -> column DDL).
@@ -162,4 +176,101 @@ def get_audit(audit_id: int) -> Optional[dict]:
     detail["result"] = json.loads(row["result_json"])
     if row["meta_json"]:
         detail["meta"] = json.loads(row["meta_json"])
+    return detail
+
+
+def insert_normalization_report(
+    *,
+    filename: Optional[str],
+    source: str,
+    report: dict,
+) -> int:
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO normalization_reports (
+                created_at, filename, source_length, identifier_count,
+                normalized_count, collision_count, raw_source, report_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                time.time(),
+                filename,
+                len(source),
+                report["identifier_count"],
+                report["normalized_count"],
+                report["collision_count"],
+                source,
+                json.dumps(report, ensure_ascii=False),
+            ),
+        )
+        return int(cur.lastrowid)
+
+
+def _norm_row_to_summary(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "filename": row["filename"],
+        "source_length": row["source_length"],
+        "identifier_count": row["identifier_count"],
+        "normalized_count": row["normalized_count"],
+        "collision_count": row["collision_count"],
+    }
+
+
+def query_normalization_reports(
+    *,
+    only_collisions: bool = False,
+    filename: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[dict]:
+    clauses: list[str] = []
+    params: list = []
+    if only_collisions:
+        clauses.append("collision_count > 0")
+    if filename:
+        # case-insensitive substring match on file name
+        clauses.append("filename LIKE ?")
+        params.append(f"%{filename}%")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    sql = (
+        "SELECT * FROM normalization_reports " + where +
+        " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+    )
+    params.extend([limit, offset])
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [_norm_row_to_summary(r) for r in rows]
+
+
+def count_normalization_reports(
+    *, only_collisions: bool = False, filename: Optional[str] = None
+) -> int:
+    clauses: list[str] = []
+    params: list = []
+    if only_collisions:
+        clauses.append("collision_count > 0")
+    if filename:
+        clauses.append("filename LIKE ?")
+        params.append(f"%{filename}%")
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    with connect() as conn:
+        row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM normalization_reports {where}", params
+        ).fetchone()
+    return int(row["c"])
+
+
+def get_normalization_report(report_id: int) -> Optional[dict]:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM normalization_reports WHERE id = ?", (report_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    detail = _norm_row_to_summary(row)
+    detail["raw_source"] = row["raw_source"]
+    detail["report"] = json.loads(row["report_json"])
     return detail

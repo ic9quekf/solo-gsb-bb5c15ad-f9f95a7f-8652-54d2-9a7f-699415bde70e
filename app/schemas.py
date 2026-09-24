@@ -45,6 +45,22 @@ class DiffAuditRequest(BaseModel):
     )
 
 
+class IdentifierNormalizationRequest(BaseModel):
+    source: str = Field(
+        ...,
+        description=(
+            "Python source code. Lexically scanned with Python's tokenize "
+            "rules; identifiers are extracted while comments, strings and "
+            "keywords are skipped. A lexical failure is rejected with 422."
+        ),
+    )
+    filename: Optional[str] = Field(
+        default=None,
+        max_length=4096,
+        description="Optional source file name for later lookup.",
+    )
+
+
 class JsonAuditRequest(BaseModel):
     document: str = Field(
         ...,

@@ -51,6 +51,9 @@ docker compose up --build
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`
 与 `POST /api/v1/audits/gate` 随服务一起可用（均通过宿主机 8000 端口访问）。
+标识符 NFKC 碰撞报告接口 `POST /api/v1/identifiers/normalization`
+（以及 `GET /api/v1/identifiers/normalization[/{id}]`）同样随服务启动，
+访问地址为 <http://localhost:8000>。
 
 ### 仅用 Docker
 
@@ -380,6 +383,128 @@ curl -s -X POST http://localhost:8000/api/v1/audits/json \
 
 `invalid_json_document` 的 `detail` 含 `offset`（出错位置的码点偏移）与
 `line` / `column`（1 起始）。
+
+### `POST /api/v1/identifiers/normalization` — Python 标识符 NFKC 规范化碰撞
+
+接收一段 **Python 源码**（`source` 字段）与可选文件名（`filename`），用 Python
+自身的词法规则（标准库 `tokenize`）扫描，提取全部**标识符**（NAME token），
+并跳过：
+
+- **注释**（`# ...`）与**字符串字面量**（普通/字节/原始/f-string 及其前缀，
+  字符串内部出现的任何文本都不参与）；
+- **关键字**（`def`/`if`/`return` 等硬关键字；`match`/`case`/`_` 等软关键字
+  仍是普通标识符，会被保留）。
+
+对每个标识符拼写做 Unicode **NFKC** 规范化（`unicodedata.normalize("NFKC", ...)`）。
+仅当**同一规范形对应至少两种不同的原文拼写**时报告碰撞：
+
+- 同一拼写单纯重复出现 → **不是碰撞**；
+- 仅大小写不同（`foo` / `Foo` / `FOO`）→ NFKC 保留 ASCII 大小写，**不是碰撞**；
+- 全角/兼容字符 → 是碰撞，例如全角 `ｆｏｏ`（U+FF46…）规范化为 `foo`、
+  连字 `ﬀ`（U+FB00）规范化为 `ff`、`ℎ`（U+210E）规范化为 `h`。
+
+每条碰撞返回规范形、涉及的每种拼写及其**全部出现位置**：码点偏移（`offset` /
+`end_offset`，0 起始、end 排他）与 1 起始行列（`position` / `end_position`）。
+同一拼写的出现按扫描顺序（即源码顺序）排列；拼写按各自首次出现位置排序；
+碰撞之间按其最早出现位置排序，整体结果稳定。标识符必须是 Python 合法标识符
+（XID_Start/XID_Continue），普通 Unicode 单词拆分不适用。
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/identifiers/normalization \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON' | jq
+{
+  "source": "def f():\n    foo = 1\n    return ｆｏｏ\n",
+  "filename": "demo.py"
+}
+JSON
+```
+
+响应（节选）：
+
+```json
+{
+  "id": 1,
+  "stored": true,
+  "filename": "demo.py",
+  "source_length": 36,
+  "identifier_count": 3,
+  "normalized_count": 2,
+  "collision_count": 1,
+  "collisions": [
+    {
+      "normalized": "foo",
+      "spelling_count": 2,
+      "spellings": [
+        {
+          "spelling": "foo",
+          "occurrence_count": 1,
+          "occurrences": [
+            {"offset": 13, "end_offset": 16,
+             "position": {"line": 2, "column": 5},
+             "end_position": {"line": 2, "column": 8}}
+          ]
+        },
+        {
+          "spelling": "ｆｏｏ",
+          "occurrence_count": 1,
+          "occurrences": [
+            {"offset": 32, "end_offset": 35,
+             "position": {"line": 3, "column": 12},
+             "end_position": {"line": 3, "column": 15}}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+说明：
+
+- `identifier_count` 是跳过注释/字符串/关键字后收集到的标识符出现总数；
+  `normalized_count` 是不同 NFKC 规范形数量。
+- 偏移与列均按 **Unicode 码点**计算（astral 字符按 1 个码点计，CRLF 同样正确）。
+- 仅语法层面非法、但词法可扫描的代码（如孤立的 `@`、前导零数字 `09`）仍会
+  正常返回；本接口只做词法提取，不做语法解析。
+- 碰撞报告作为**独立记录**保存（不与 bidi 审计表混用）；没有碰撞的扫描结果
+  （`collision_count: 0`，包括空源码、纯注释源码）同样落库。
+
+词法扫描失败时返回 **422**，`detail` 含出错位置（`offset` 为源码码点偏移，
+`line` / `column` 为 1 起始行列）与原因，且**不产生任何报告记录**：
+
+| 触发条件 | 定位 |
+|---|---|
+| 非法字符（`$`、反引号、NUL、非 XID_Start 符如 `㎚`） | 该字符本身 |
+| 未闭合的字符串（单行，lexer 以 ERRORTOKEN 报告） | 起始引号 |
+| 未闭合的三引号/多行结构（TokenError） | 词法器报告位置 |
+| 缩进错误（`IndentationError` / `TabError`） | 异常行列 |
+
+```json
+{
+  "detail": {
+    "error": "invalid_python_source",
+    "offset": 6,
+    "line": 2,
+    "column": 1,
+    "message": "unexpected character '$'"
+  }
+}
+```
+
+### `GET /api/v1/identifiers/normalization[/{id}]` — 读取碰撞报告
+
+- `GET /api/v1/identifiers/normalization/{id}` — 返回单条报告：摘要、原始源码
+  `raw_source` 与完整 `report`（结构与 POST 响应中的碰撞部分一致）。记录不存在
+  返回 `404`（`{"detail": "normalization report not found"}`）。
+- `GET /api/v1/identifiers/normalization` — 列出报告摘要（不含原文/详情），
+  支持 `only_collisions=true`（仅含碰撞的报告）、`filename`（大小写不敏感子串）、
+  `limit` / `offset` 分页，按创建时间倒序。
+
+```bash
+curl -s http://localhost:8000/api/v1/identifiers/normalization/1 | jq
+curl -s 'http://localhost:8000/api/v1/identifiers/normalization?only_collisions=true&limit=20' | jq
+```
 
 ### `GET /api/v1/audits` — 查询历史记录
 
@@ -786,6 +911,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── bidi.py        # UAX#9 控制符解析、配对栈、风险评级、转义预览
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
+│   ├── identifier_norm.py # Python 词法标识符提取 + NFKC 规范化碰撞（位置/偏移）
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
